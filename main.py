@@ -344,6 +344,15 @@ class ShopDashboard(tk.Tk):
             command=self.show_optimizer,
         ).pack(fill=tk.X, padx=12, pady=4)
 
+        tk.Label(
+            self.sidebar,
+            text="CSV + JSON\nлокальные данные",
+            bg="#16213e",
+            fg="#9fb3c8",
+            font=("Segoe UI", 8),
+            justify="left",
+        ).pack(side=tk.BOTTOM, anchor="w", padx=18, pady=18)
+
         self.page = ttk.Frame(self, style="Page.TFrame")
         self.page.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
