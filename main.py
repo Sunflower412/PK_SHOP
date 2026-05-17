@@ -1,6 +1,8 @@
 import csv
 import json
+from itertools import combinations
 from pathlib import Path
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -108,6 +110,9 @@ def calculate_quality(products):
 
         item = dict(product)
         item["quality"] = score
+        item["profit"] = (
+            item["price"] - item["stock_cost"]
+        ) * item["expected_sales"]
         result.append(item)
 
     result.sort(key=lambda item: item["quality"], reverse=True)
@@ -212,6 +217,51 @@ def correlation_matrix(sales):
     return np.corrcoef(values, rowvar=False)
 
 
+def find_best_set(products, budget, required_sales, selected_type):
+    candidates = [
+        item for item in calculate_quality(products)
+        if item["type"] == selected_type
+    ]
+
+    best_set = None
+    best_score = -1
+
+    for count in range(1, len(candidates) + 1):
+        for group in combinations(candidates, count):
+            total_cost = sum(item["stock_cost"] for item in group)
+            total_sales = sum(item["expected_sales"] for item in group)
+
+            if total_cost > budget:
+                continue
+            if total_sales < required_sales:
+                continue
+
+            score = sum(
+                item["quality"] * item["expected_sales"]
+                + item["profit"] / 100000
+                for item in group
+            )
+
+            if score > best_score:
+                best_score = score
+                best_set = group
+
+    if not best_set:
+        return None
+
+    return {
+        "products": best_set,
+        "total_cost": sum(item["stock_cost"] for item in best_set),
+        "total_sales": sum(item["expected_sales"] for item in best_set),
+        "total_profit": sum(item["profit"] for item in best_set),
+        "average_quality": average([item["quality"] for item in best_set]),
+    }
+
+
+def format_money(value):
+    return f"{value:,.0f}".replace(",", " ")
+
+
 class ShopDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -286,6 +336,12 @@ class ShopDashboard(tk.Tk):
             text="Прогноз",
             style="Sidebar.TButton",
             command=self.show_forecast,
+        ).pack(fill=tk.X, padx=12, pady=4)
+        ttk.Button(
+            self.sidebar,
+            text="Подбор",
+            style="Sidebar.TButton",
+            command=self.show_optimizer,
         ).pack(fill=tk.X, padx=12, pady=4)
 
         self.page = ttk.Frame(self, style="Page.TFrame")
@@ -684,8 +740,147 @@ class ShopDashboard(tk.Tk):
 
         draw()
 
+    def show_optimizer(self):
+        self.clear_page()
+
+        ttk.Label(
+            self.page,
+            text="Подбор ассортимента",
+            style="Title.TLabel",
+        ).pack(anchor="w", padx=24, pady=(22, 12))
+
+        body = ttk.Frame(self.page, style="Page.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 20))
+
+        panel = ttk.Frame(body, style="Card.TFrame", padding=16)
+        panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 14))
+
+        product_types = sorted({product["type"] for product in self.products})
+        selected_type = tk.StringVar(value=product_types[0])
+
+        ttk.Label(panel, text="Группа товаров", style="CardName.TLabel").pack(anchor="w")
+        ttk.Combobox(
+            panel,
+            textvariable=selected_type,
+            values=product_types,
+            state="readonly",
+            width=22,
+        ).pack(fill=tk.X, pady=(2, 8))
+
+        ttk.Label(panel, text="Бюджет закупки", style="CardName.TLabel").pack(anchor="w")
+        budget_entry = ttk.Entry(panel, width=18)
+        budget_entry.insert(0, "500000")
+        budget_entry.pack(fill=tk.X, pady=(2, 8))
+
+        ttk.Label(panel, text="Минимум продаж", style="CardName.TLabel").pack(anchor="w")
+        sales_entry = ttk.Entry(panel, width=18)
+        sales_entry.insert(0, "120")
+        sales_entry.pack(fill=tk.X, pady=(2, 8))
+
+        summary = tk.StringVar(value="")
+        ttk.Label(
+            panel,
+            textvariable=summary,
+            style="CardName.TLabel",
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(12, 0))
+
+        result_area = ttk.Frame(body, style="Page.TFrame")
+        result_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def draw_result():
+            for widget in result_area.winfo_children():
+                widget.destroy()
+
+            try:
+                budget = float(budget_entry.get().replace(",", "."))
+                required_sales = float(sales_entry.get().replace(",", "."))
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите числовые значения.")
+                return
+
+            result = find_best_set(
+                self.products,
+                budget,
+                required_sales,
+                selected_type.get(),
+            )
+
+            if result is None:
+                summary.set("Набор не найден.\nИзмените ограничения.")
+                return
+
+            summary.set(
+                f"Закупка: {format_money(result['total_cost'])} руб.\n"
+                f"Продажи: {result['total_sales']} шт.\n"
+                f"Маржа: {format_money(result['total_profit'])} руб.\n"
+                f"Средний Q: {result['average_quality']:.3f}"
+            )
+
+            columns = ("name", "quality", "sales", "cost", "profit")
+            table = ttk.Treeview(result_area, columns=columns, show="headings", height=8)
+            table.heading("name", text="Товар")
+            table.heading("quality", text="Q")
+            table.heading("sales", text="Продажи")
+            table.heading("cost", text="Закупка")
+            table.heading("profit", text="Маржа")
+
+            table.column("name", width=280)
+            table.column("quality", width=80, anchor=tk.CENTER)
+            table.column("sales", width=90, anchor=tk.CENTER)
+            table.column("cost", width=110, anchor=tk.CENTER)
+            table.column("profit", width=110, anchor=tk.CENTER)
+
+            for item in result["products"]:
+                table.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        item["name"],
+                        round(item["quality"], 3),
+                        item["expected_sales"],
+                        item["stock_cost"],
+                        int(item["profit"]),
+                    ),
+                )
+
+            table.pack(fill=tk.X)
+
+            figure = Figure(figsize=(7.4, 3.6), dpi=100, facecolor="#edf2f7")
+            axes = figure.add_subplot(111)
+            names = [item["name"].split(" ", 1)[-1] for item in result["products"]]
+            values = [item["quality"] for item in result["products"]]
+            axes.barh(list(reversed(names)), list(reversed(values)), color="#2563eb")
+            axes.set_title("Качество выбранных товаров")
+            axes.set_xlim(0, 1)
+            axes.grid(True, axis="x", color="#cbd5e1")
+            figure.tight_layout()
+
+            canvas = FigureCanvasTkAgg(figure, result_area)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+
+        ttk.Button(panel, text="Подобрать", command=draw_result).pack(fill=tk.X, pady=(10, 0))
+        draw_result()
+
+
+def check_project():
+    sales = load_sales()
+    products = load_products()
+    quality = calculate_quality(products)
+    model = train_model(sales)
+
+    print(f"строк продаж: {len(sales)}")
+    print(f"товаров: {len(products)}")
+    print(f"лучший товар: {quality[0]['name']}")
+    print(f"R2: {model['r2']:.3f}")
+
 
 def main():
+    if "--check" in sys.argv:
+        check_project()
+        return
+
     app = ShopDashboard()
     app.mainloop()
 
