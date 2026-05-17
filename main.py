@@ -2,8 +2,9 @@ import csv
 import json
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -11,6 +12,7 @@ from matplotlib.figure import Figure
 BASE_DIR = Path(__file__).resolve().parent
 SALES_PATH = BASE_DIR / "data" / "PC_shop.csv"
 PRODUCTS_PATH = BASE_DIR / "data" / "products.json"
+INFO_PATH = BASE_DIR / "data" / "PC_shop_info.txt"
 
 FEATURES = [
     "avg_pc_price",
@@ -40,11 +42,17 @@ QUALITY_METRICS = {
 }
 
 
-def load_sales():
+def load_sales_from_path(path):
     rows = []
 
-    with open(SALES_PATH, "r", encoding="utf-8-sig", newline="") as file:
+    with open(path, "r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
+        missing_columns = [
+            column for column in FEATURES + [TARGET]
+            if column not in (reader.fieldnames or [])
+        ]
+        if missing_columns:
+            raise ValueError("Нет колонок: " + ", ".join(missing_columns))
         for row in reader:
             rows.append({
                 column: float(row[column])
@@ -52,6 +60,16 @@ def load_sales():
             })
 
     return rows
+
+
+def load_sales():
+    return load_sales_from_path(SALES_PATH)
+
+
+def load_info():
+    if INFO_PATH.exists():
+        return INFO_PATH.read_text(encoding="utf-8")
+    return ""
 
 
 def load_products():
@@ -115,6 +133,85 @@ def normalized_profile(product, products):
     return names, values
 
 
+def train_model(sales):
+    x_values = np.array(
+        [[row[column] for column in FEATURES] for row in sales],
+        dtype=float,
+    )
+    y_values = np.array([row[TARGET] for row in sales], dtype=float)
+
+    rng = np.random.default_rng(42)
+    order = rng.permutation(len(y_values))
+    test_count = max(5, round(len(y_values) * 0.2))
+    test_index = order[:test_count]
+    train_index = order[test_count:]
+
+    x_train = x_values[train_index]
+    y_train = y_values[train_index]
+    x_test = x_values[test_index]
+    y_test = y_values[test_index]
+
+    means = x_train.mean(axis=0)
+    stds = x_train.std(axis=0)
+    stds[stds == 0] = 1
+
+    scaled = (x_train - means) / stds
+    design = np.column_stack([np.ones(len(scaled)), scaled])
+
+    # Небольшая регуляризация делает модель устойчивее.
+    penalty = np.eye(design.shape[1])
+    penalty[0, 0] = 0
+    beta = np.linalg.pinv(design.T @ design + 0.8 * penalty) @ design.T @ y_train
+
+    predicted = predict_array(x_test, means, stds, beta)
+    errors = y_test - predicted
+
+    mae = float(np.mean(np.abs(errors)))
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+    ss_res = float(np.sum(errors ** 2))
+    ss_tot = float(np.sum((y_test - y_test.mean()) ** 2))
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0
+
+    return {
+        "means": means,
+        "stds": stds,
+        "beta": beta,
+        "actual": [float(value) for value in y_test],
+        "predicted": [float(value) for value in predicted],
+        "mae": mae,
+        "rmse": rmse,
+        "r2": float(r2),
+    }
+
+
+def predict_array(x_values, means, stds, beta):
+    scaled = (x_values - means) / stds
+    design = np.column_stack([np.ones(len(scaled)), scaled])
+    return design @ beta
+
+
+def predict_sales(model, values):
+    x_values = np.array(
+        [[values[column] for column in FEATURES]],
+        dtype=float,
+    )
+    prediction = predict_array(
+        x_values,
+        model["means"],
+        model["stds"],
+        model["beta"],
+    )[0]
+    return max(float(prediction), 0)
+
+
+def correlation_matrix(sales):
+    values = np.array(
+        [[row[column] for column in FEATURES + [TARGET]] for row in sales],
+        dtype=float,
+    )
+    return np.corrcoef(values, rowvar=False)
+
+
 class ShopDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -122,6 +219,7 @@ class ShopDashboard(tk.Tk):
         self.sales = load_sales()
         self.products = load_products()
         self.quality = calculate_quality(self.products)
+        self.model = train_model(self.sales)
 
         self.title("Панель магазина")
         self.geometry("1060x640")
@@ -167,6 +265,12 @@ class ShopDashboard(tk.Tk):
         ).pack(fill=tk.X, padx=12, pady=4)
         ttk.Button(
             self.sidebar,
+            text="Данные",
+            style="Sidebar.TButton",
+            command=self.show_data,
+        ).pack(fill=tk.X, padx=12, pady=4)
+        ttk.Button(
+            self.sidebar,
             text="Качество",
             style="Sidebar.TButton",
             command=self.show_quality,
@@ -176,6 +280,12 @@ class ShopDashboard(tk.Tk):
             text="Профиль товара",
             style="Sidebar.TButton",
             command=self.show_profile,
+        ).pack(fill=tk.X, padx=12, pady=4)
+        ttk.Button(
+            self.sidebar,
+            text="Прогноз",
+            style="Sidebar.TButton",
+            command=self.show_forecast,
         ).pack(fill=tk.X, padx=12, pady=4)
 
         self.page = ttk.Frame(self, style="Page.TFrame")
@@ -228,6 +338,80 @@ class ShopDashboard(tk.Tk):
         canvas = FigureCanvasTkAgg(figure, self.page)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+
+    def show_data(self):
+        self.clear_page()
+
+        ttk.Label(
+            self.page,
+            text="Исходные данные",
+            style="Title.TLabel",
+        ).pack(anchor="w", padx=24, pady=(22, 12))
+
+        toolbar = ttk.Frame(self.page, style="Page.TFrame")
+        toolbar.pack(fill=tk.X, padx=24)
+
+        status = tk.StringVar(value=f"{len(self.sales)} строк загружено")
+
+        def choose_file():
+            path = filedialog.askopenfilename(
+                filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")]
+            )
+            if not path:
+                return
+
+            try:
+                self.sales = load_sales_from_path(Path(path))
+                self.model = train_model(self.sales)
+            except Exception as error:
+                messagebox.showerror("Ошибка", str(error))
+                return
+
+            status.set(f"{len(self.sales)} строк загружено")
+            self.show_data()
+
+        ttk.Button(toolbar, text="Загрузить CSV", command=choose_file).pack(side=tk.LEFT)
+        ttk.Label(toolbar, textvariable=status).pack(side=tk.LEFT, padx=12)
+
+        body = ttk.Frame(self.page, style="Page.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=14)
+
+        table_frame = ttk.Frame(body)
+        table_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+
+        columns = FEATURES + [TARGET]
+        table = ttk.Treeview(table_frame, columns=columns, show="headings")
+        for column in columns:
+            table.heading(column, text=LABELS[column])
+            table.column(column, width=115, anchor=tk.CENTER)
+
+        for row in self.sales:
+            table.insert(
+                "",
+                tk.END,
+                values=tuple(int(row[column]) for column in columns),
+            )
+
+        y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=table.xview)
+        table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        table.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        info = tk.Text(
+            body,
+            width=34,
+            wrap=tk.WORD,
+            bg="#ffffff",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9),
+        )
+        info.insert(tk.END, load_info())
+        info.configure(state=tk.DISABLED)
+        info.pack(side=tk.LEFT, fill=tk.BOTH)
 
     def show_quality(self):
         self.clear_page()
@@ -360,6 +544,145 @@ class ShopDashboard(tk.Tk):
         ).pack(side=tk.LEFT, padx=10)
 
         draw_profile()
+
+    def show_forecast(self):
+        self.clear_page()
+
+        ttk.Label(
+            self.page,
+            text="Прогноз продаж",
+            style="Title.TLabel",
+        ).pack(anchor="w", padx=24, pady=(22, 12))
+
+        body = ttk.Frame(self.page, style="Page.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 20))
+
+        panel = ttk.Frame(body, style="Card.TFrame", padding=16)
+        panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 14))
+
+        defaults = {
+            column: average([row[column] for row in self.sales])
+            for column in FEATURES
+        }
+        defaults["is_new_product_launch"] = 1
+
+        entries = {}
+
+        for column in FEATURES:
+            ttk.Label(panel, text=LABELS[column], style="CardName.TLabel").pack(anchor="w", pady=(4, 2))
+            entry = ttk.Entry(panel, width=18)
+            entry.insert(0, round(defaults[column], 2))
+            entry.pack(fill=tk.X)
+            entries[column] = entry
+
+        feature_var = tk.StringVar(value="marketing_budget")
+
+        ttk.Label(panel, text="График по признаку", style="CardName.TLabel").pack(anchor="w", pady=(12, 2))
+        ttk.Combobox(
+            panel,
+            textvariable=feature_var,
+            values=FEATURES,
+            state="readonly",
+            width=18,
+        ).pack(fill=tk.X)
+
+        result_var = tk.StringVar(value="")
+        ttk.Label(panel, textvariable=result_var, style="CardValue.TLabel").pack(anchor="w", pady=(14, 4))
+
+        chart_frame = ttk.Frame(body, style="Page.TFrame")
+        chart_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def read_values():
+            values = {}
+
+            for column in FEATURES:
+                values[column] = float(entries[column].get().replace(",", "."))
+
+            values["is_new_product_launch"] = (
+                1 if values["is_new_product_launch"] >= 0.5 else 0
+            )
+            return values
+
+        def draw():
+            for widget in chart_frame.winfo_children():
+                widget.destroy()
+
+            try:
+                values = read_values()
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите числовые значения.")
+                return
+
+            prediction = predict_sales(self.model, values)
+            result_var.set(f"{prediction:.0f} шт.")
+
+            feature = feature_var.get()
+
+            if feature == "is_new_product_launch":
+                x_values = [0, 1]
+            else:
+                column_values = [row[feature] for row in self.sales]
+                x_values = np.linspace(min(column_values), max(column_values), 32)
+
+            y_values = []
+            for value in x_values:
+                row = dict(values)
+                row[feature] = float(value)
+                if feature == "is_new_product_launch":
+                    row[feature] = 1 if value >= 0.5 else 0
+                y_values.append(predict_sales(self.model, row))
+
+            figure = Figure(figsize=(8.5, 5.3), dpi=100, facecolor="#edf2f7")
+            ax1 = figure.add_subplot(2, 2, 1)
+            ax2 = figure.add_subplot(2, 2, 2)
+            ax3 = figure.add_subplot(2, 1, 2)
+
+            numbers = list(range(1, len(self.model["actual"]) + 1))
+            ax1.plot(numbers, self.model["actual"], marker="o", label="Факт")
+            ax1.plot(numbers, self.model["predicted"], marker="s", label="Прогноз")
+            ax1.set_title("Проверка модели")
+            ax1.grid(True, color="#cbd5e1")
+            ax1.legend(fontsize=8)
+
+            ax2.plot(x_values, y_values, color="#0f766e", marker="o")
+            ax2.set_title(f"Влияние: {LABELS[feature]}")
+            ax2.grid(True, color="#cbd5e1")
+
+            matrix = correlation_matrix(self.sales)
+            image = ax3.imshow(matrix, vmin=-1, vmax=1, cmap="coolwarm")
+            names = [LABELS[column] for column in FEATURES + [TARGET]]
+            ax3.set_title("Матрица корреляций")
+            ax3.set_xticks(range(len(names)))
+            ax3.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+            ax3.set_yticks(range(len(names)))
+            ax3.set_yticklabels(names, fontsize=8)
+
+            for row_index in range(len(names)):
+                for column_index in range(len(names)):
+                    ax3.text(
+                        column_index,
+                        row_index,
+                        f"{matrix[row_index, column_index]:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                    )
+
+            figure.colorbar(image, ax=ax3, fraction=0.03, pad=0.03)
+            figure.tight_layout()
+
+            canvas = FigureCanvasTkAgg(figure, chart_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        ttk.Button(panel, text="Рассчитать", command=draw).pack(fill=tk.X, pady=(10, 6))
+        ttk.Label(
+            panel,
+            text=f"MAE: {self.model['mae']:.1f}\nRMSE: {self.model['rmse']:.1f}\nR2: {self.model['r2']:.3f}",
+            style="CardName.TLabel",
+        ).pack(anchor="w")
+
+        draw()
 
 
 def main():
