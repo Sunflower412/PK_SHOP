@@ -4,11 +4,13 @@ from itertools import combinations
 from pathlib import Path
 import sys
 import tkinter as tk
+from time import perf_counter
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from scipy.optimize import linprog
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,6 +44,18 @@ QUALITY_METRICS = {
     "service": ("Сервис", 0.16, "max"),
     "price": ("Цена", 0.12, "min"),
 }
+
+SUPPLIERS = ["Sup1", "Sup2", "Sup3", "Sup4"]
+SHOPS = ["Sh1", "Sh2", "Sh3"]
+SUPPLY_LIMITS = np.array([200, 180, 150, 120], dtype=float)
+SHOP_DEMAND = np.array([160, 140, 170], dtype=float)
+SUPPLY_COSTS = np.array([
+    [45000, 47000, 50000],
+    [48000, 46000, 49000],
+    [52000, 51000, 48000],
+    [55000, 53000, 52000],
+], dtype=float)
+SUPPLY_METHODS = ["highs", "highs-ds", "highs-ipm"]
 
 
 def load_sales_from_path(path):
@@ -258,6 +272,52 @@ def find_best_set(products, budget, required_sales, selected_type):
     }
 
 
+def solve_supply_plan(method="highs"):
+    supplier_count = len(SUPPLIERS)
+    shop_count = len(SHOPS)
+    variable_count = supplier_count * shop_count
+    c_values = SUPPLY_COSTS.flatten()
+
+    supply_matrix = np.zeros((supplier_count, variable_count))
+    for supplier_index in range(supplier_count):
+        start = supplier_index * shop_count
+        supply_matrix[supplier_index, start:start + shop_count] = 1
+
+    demand_matrix = np.zeros((shop_count, variable_count))
+    for shop_index in range(shop_count):
+        demand_matrix[shop_index, shop_index::shop_count] = 1
+
+    started = perf_counter()
+    result = linprog(
+        c=c_values,
+        A_ub=supply_matrix,
+        b_ub=SUPPLY_LIMITS,
+        A_eq=demand_matrix,
+        b_eq=SHOP_DEMAND,
+        bounds=[(0, None)] * variable_count,
+        method=method,
+    )
+    work_time = perf_counter() - started
+
+    if not result.success:
+        raise ValueError(result.message)
+
+    plan = result.x.reshape(supplier_count, shop_count)
+
+    return {
+        "method": method,
+        "plan": plan,
+        "total_cost": float(result.fun),
+        "work_time": work_time,
+        "supplier_load": plan.sum(axis=1),
+        "shop_received": plan.sum(axis=0),
+    }
+
+
+def compare_supply_methods():
+    return [solve_supply_plan(method) for method in SUPPLY_METHODS]
+
+
 def format_money(value):
     return f"{value:,.0f}".replace(",", " ")
 
@@ -270,6 +330,7 @@ class ShopDashboard(tk.Tk):
         self.products = load_products()
         self.quality = calculate_quality(self.products)
         self.model = train_model(self.sales)
+        self.supply_results = compare_supply_methods()
 
         self.title("Панель магазина")
         self.geometry("1060x640")
@@ -342,6 +403,12 @@ class ShopDashboard(tk.Tk):
             text="Подбор",
             style="Sidebar.TButton",
             command=self.show_optimizer,
+        ).pack(fill=tk.X, padx=12, pady=4)
+        ttk.Button(
+            self.sidebar,
+            text="Поставки",
+            style="Sidebar.TButton",
+            command=self.show_supplies,
         ).pack(fill=tk.X, padx=12, pady=4)
 
         tk.Label(
@@ -872,17 +939,127 @@ class ShopDashboard(tk.Tk):
         ttk.Button(panel, text="Подобрать", command=draw_result).pack(fill=tk.X, pady=(10, 0))
         draw_result()
 
+    def show_supplies(self):
+        self.clear_page()
+
+        ttk.Label(
+            self.page,
+            text="План поставок",
+            style="Title.TLabel",
+        ).pack(anchor="w", padx=24, pady=(22, 12))
+
+        best_result = min(self.supply_results, key=lambda item: item["total_cost"])
+        plan = best_result["plan"]
+
+        body = ttk.Frame(self.page, style="Page.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 20))
+
+        panel = ttk.Frame(body, style="Card.TFrame", padding=16)
+        panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 14))
+
+        ttk.Label(panel, text="Минимальные затраты", style="CardName.TLabel").pack(anchor="w")
+        ttk.Label(
+            panel,
+            text=f"{format_money(best_result['total_cost'])} руб.",
+            style="CardValue.TLabel",
+        ).pack(anchor="w", pady=(4, 12))
+
+        ttk.Label(panel, text="Методы SciPy", style="CardName.TLabel").pack(anchor="w")
+        for item in self.supply_results:
+            ttk.Label(
+                panel,
+                text=f"{item['method']}: {item['work_time']:.5f} сек.",
+                style="CardName.TLabel",
+            ).pack(anchor="w", pady=2)
+
+        ttk.Label(
+            panel,
+            text=(
+                f"\nСпрос: {int(SHOP_DEMAND.sum())} шт.\n"
+                f"Доступно: {int(SUPPLY_LIMITS.sum())} шт.\n"
+                f"Свободный лимит: {int(SUPPLY_LIMITS.sum() - SHOP_DEMAND.sum())} шт."
+            ),
+            style="CardName.TLabel",
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(12, 0))
+
+        content = ttk.Frame(body, style="Page.TFrame")
+        content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        columns = ("supplier", *SHOPS, "total", "limit", "free")
+        table = ttk.Treeview(content, columns=columns, show="headings", height=6)
+        table.heading("supplier", text="Поставщик")
+        for shop in SHOPS:
+            table.heading(shop, text=shop)
+        table.heading("total", text="Итого")
+        table.heading("limit", text="Лимит")
+        table.heading("free", text="Остаток")
+
+        table.column("supplier", width=120)
+        for shop in SHOPS:
+            table.column(shop, width=90, anchor=tk.CENTER)
+        table.column("total", width=90, anchor=tk.CENTER)
+        table.column("limit", width=90, anchor=tk.CENTER)
+        table.column("free", width=90, anchor=tk.CENTER)
+
+        for index, supplier in enumerate(SUPPLIERS):
+            load = best_result["supplier_load"][index]
+            table.insert(
+                "",
+                tk.END,
+                values=(
+                    supplier,
+                    *(int(value) for value in plan[index]),
+                    int(load),
+                    int(SUPPLY_LIMITS[index]),
+                    int(SUPPLY_LIMITS[index] - load),
+                ),
+            )
+
+        table.pack(fill=tk.X)
+
+        figure = Figure(figsize=(7.2, 4.2), dpi=100, facecolor="#edf2f7")
+        axes = figure.add_subplot(111)
+        image = axes.imshow(plan, cmap="YlGnBu")
+        axes.set_title("Распределение поставок, шт.")
+        axes.set_xticks(range(len(SHOPS)))
+        axes.set_xticklabels(SHOPS)
+        axes.set_yticks(range(len(SUPPLIERS)))
+        axes.set_yticklabels(SUPPLIERS)
+
+        for row_index in range(len(SUPPLIERS)):
+            for column_index in range(len(SHOPS)):
+                value = int(plan[row_index, column_index])
+                axes.text(
+                    column_index,
+                    row_index,
+                    value,
+                    ha="center",
+                    va="center",
+                    color="#111827",
+                    fontsize=10,
+                )
+
+        figure.colorbar(image, ax=axes, fraction=0.04, pad=0.04)
+        figure.tight_layout()
+
+        canvas = FigureCanvasTkAgg(figure, content)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+
 
 def check_project():
     sales = load_sales()
     products = load_products()
     quality = calculate_quality(products)
     model = train_model(sales)
+    supply_result = solve_supply_plan()
 
     print(f"строк продаж: {len(sales)}")
     print(f"товаров: {len(products)}")
     print(f"лучший товар: {quality[0]['name']}")
     print(f"R2: {model['r2']:.3f}")
+    print(f"поставки: {supply_result['total_cost']:.0f}")
 
 
 def main():
